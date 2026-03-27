@@ -5,7 +5,7 @@ from datasets import load_dataset, Dataset, disable_progress_bar
 disable_progress_bar()
 from tqdm import tqdm
 
-def main(output_path: str, dataset_path: str, model_id: str = 'benoitfavre/nllb-200-distilled-600m_text2picto', device: str='cuda', batch_size=32):
+def main(output_path: str, dataset_path: str, model_id: str = 'benoitfavre/nllb-200-distilled-600m_text2picto', source_column: str = 'simplified', device: str='cuda', batch_size=32):
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     model = AutoModelForSeq2SeqLM.from_pretrained(model_id).to(device)
 
@@ -61,13 +61,19 @@ def main(output_path: str, dataset_path: str, model_id: str = 'benoitfavre/nllb-
 
 
     dataset = Dataset.from_parquet(dataset_path)
-    total = sum([len(instance['simplified']) for instance in dataset])
+    total = sum([len(instance[source_column]) if isinstance(instance[source_column], list) else 1 for instance in dataset])
 
     def iterator():
         batch = []
         for i, instance in enumerate(dataset):
-            for j, sentence in enumerate(instance['simplified']):
-                batch.append({'id': f'{os.path.basename(dataset_path)}:{i}:{j}', 'text': sentence})
+            if isinstance(instance[source_column], list):
+                for j, sentence in enumerate(instance[source_column]):
+                    batch.append({'id': f'{os.path.basename(dataset_path)}:{i}:{j}', 'text': sentence})
+                    if len(batch) == batch_size:
+                        yield batch
+                        batch = []
+            else:
+                batch.append({'id': f'{os.path.basename(dataset_path)}:{i}', 'text': instance[source_column]})
                 if len(batch) == batch_size:
                     yield batch
                     batch = []
