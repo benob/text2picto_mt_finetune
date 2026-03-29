@@ -3,3 +3,5 @@ transformers
 datasets
 wandb
 fire
+unidecode
+stop-words

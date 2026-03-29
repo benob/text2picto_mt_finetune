@@ -10,9 +10,11 @@ import random
 import os
 from tqdm.auto import tqdm, trange
 
+from stop_words import get_stop_words
+from unidecode import unidecode
 import torch
 import datasets
-from datasets import concatenate_datasets, load_dataset
+from datasets import concatenate_datasets, load_dataset, Dataset
 from torch.amp import autocast, GradScaler
 from transformers import AutoModelForSeq2SeqLM, NllbTokenizer, Adafactor, get_constant_schedule_with_warmup
 
@@ -37,31 +39,63 @@ grad_accum     = 1
 p_src2tgt      = 0.5         # P(fr→picto), else picto→fr
 eval_interval  = 100
 log_interval   = 10
-use_emb_init   = False
+use_emb_init   = True
 
 src_lid  = "fra_Latn"
 tgt_lid  = "picto"
 
-def convert_instance(instance):
+picto_prefix = '\uE000' # first char of private unicode area
+
+def augment_text(text, p_augment=.25): # fix some instances with capitalization and punctuation, also strip accents
+    text = text.strip()
+    if len(text) > 0:
+        if text[-1].isalnum() and random.random() < p_augment: text += '.'
+        if text[0].islower() and random.random() < p_augment: text = text.capitalize()
+        if random.random() < p_augment: text = unidecode(text)
+    return text
+
+def convert_instance(instance): # add space before pictos for clean tokenization
   return {
     src_lid: instance['text'],
-    tgt_lid: ' '.join(instance['pictos']) if isinstance(instance['pictos'], list) else instance['pictos'],
+    tgt_lid: picto_prefix + (' '.join(instance['pictos']) if isinstance(instance['pictos'], list) else instance['pictos']).replace(' ', picto_prefix),
   }
 
-train_data = concatenate_datasets([load_dataset(dataset_id, split='train').map(convert_instance) for dataset_id in dataset_ids])
-valid_data = load_dataset(dataset_ids[0], split='validation').map(convert_instance)
-test_data = load_dataset(dataset_ids[0], split='test').map(convert_instance)
+stop_words = set(get_stop_words('fr'))
+
+def noise_filter(instance):
+    text = instance[src_lid]
+    picto = instance[tgt_lid]
+    num_content_words = len([x for x in text.lower().strip().split() if x not in stop_words])
+    num_picto = len(picto.replace(picto_prefix, ' ').strip().split())
+    return num_picto >= num_content_words / 2
 
 # training data was generated from english lexicon
 with open('arasaac-en.json') as fp:
     lexicon = json.load(fp)
-    added_vocab = [str(entry['_id']) for entry in lexicon]
+    added_vocab = [picto_prefix + str(entry['_id']) for entry in lexicon]
     lemmas = {
-        entry['_id']:
+        picto_prefix + str(entry['_id']):
             [kw['keyword'] for kw in entry['keywords'] if 'keyword' in kw] 
             + [kw['plural'] for kw in entry['keywords'] if 'plural' in kw] 
         for entry in lexicon
     }
+
+    # make dataset from lexicon
+    lexicon_entries = []
+    for k, v in lemmas.items():
+        for lemma in v:
+            lexicon_entries.append({
+                src_lid: lemma,
+                tgt_lid: picto_prefix + k,
+            })
+    lexicon_dataset = Dataset.from_list(lexicon_entries)
+
+train_data = concatenate_datasets([lexicon_dataset] + [load_dataset(dataset_id, split='train').map(convert_instance) for dataset_id in dataset_ids]).filter(noise_filter)
+
+valid_data = load_dataset(dataset_ids[0], split='validation').map(convert_instance)
+test_data = load_dataset(dataset_ids[0], split='test').map(convert_instance)
+
+print(len(train_data), len(valid_data), len(test_data))
 
 # add picto ids to tokenizer
 tokenizer = NllbTokenizer.from_pretrained(model_id)
@@ -86,6 +120,7 @@ def init_model(model_id):
         if new_id > max_token_id:
           # init new embeddings with mean of lemmas associated with picto
           ids_old = tokenizer.encode(lemmas[token], add_special_tokens=False)
+          ids_old = list(set(sum(ids_old, []))) # average over all lemmas
           emb[new_id] = emb[ids_old].mean(0)
           lm_head[new_id] = lm_head[ids_old].mean(0)
 
@@ -97,9 +132,14 @@ def init_model(model_id):
   model = model.to(device)
   return model
 
+print('check picto tokens', [tokenizer.decode(x) for x in tokenizer.encode(train_data[42]['picto'])])
+
 def encode_batch(tokenizer, src_texts, tgt_texts, src_code, max_length, device):
     src_texts = ["" if x is None else str(x) for x in src_texts]
     tgt_texts = ["" if x is None else str(x) for x in tgt_texts]
+
+    # only modify instances if they are in the direction text2picto
+    if src_code == src_lid: src_texts = [augment_text(x, p_augment=.25) for x in src_texts]
 
     tokenizer.src_lang = src_code
 
@@ -287,11 +327,13 @@ with wandb.init(project=wandb_project, config=wandb_config) as run:
                 tgt_texts = batch[tgt_lid]
                 src_code  = src_lid
                 forced_id = tgt_id
+                direction = 'forward'
             else:
                 src_texts = batch[tgt_lid]
                 tgt_texts = batch[src_lid]
                 src_code  = tgt_lid
                 forced_id = src_id
+                direction = 'backward'
 
             loss = training_step(
                 tokenizer,
@@ -318,7 +360,7 @@ with wandb.init(project=wandb_project, config=wandb_config) as run:
                 optimizer.zero_grad(set_to_none=True)
                 scheduler.step()
 
-            to_log = {"train_loss": train_losses[-1]}
+            to_log = {"train_loss": train_losses[-1], f"train_loss_{direction}": train_losses[-1]}
             if (step + 1) % log_interval == 0:
                 recent = np.mean(train_losses[-log_interval:])
                 pbar.set_postfix(loss_train=f"{recent:.4f}")
@@ -326,7 +368,7 @@ with wandb.init(project=wandb_project, config=wandb_config) as run:
             if (step + 1) % eval_interval == 0 and len(valid_data):
                 loss_forward, loss_backward = eval_loss(tokenizer, model, valid_data, src_lid, tgt_lid, max_length, device, forced_id, sample_size=batch_size)
                 pbar.set_postfix(loss_f=f"{loss_forward:.4f}", loss_b=f"{loss_backward:.4f}")
-                to_log.update({"val_loss_forward": loss_forward, "val_loss_backward": loss_backward})
+                to_log.update({"val_loss_forward": loss_forward, "val_loss_backward": loss_backward, 'val_loss': (loss_forward + loss_backward) / 2})
             run.log(to_log)
 
         except RuntimeError as e:
@@ -342,7 +384,7 @@ with wandb.init(project=wandb_project, config=wandb_config) as run:
 
 print("\nTraining done.")
 
-repo_id = model_id.split('/')[-1] + '_text2picto'
+repo_id = model_id.split('/')[-1] + '_text2picto_v3'
 tokenizer.save_pretrained(repo_id)
 model.save_pretrained(repo_id)
 

@@ -5,7 +5,7 @@ from datasets import load_dataset, Dataset, disable_progress_bar
 disable_progress_bar()
 from tqdm import tqdm
 
-def main(output_path: str, dataset_path: str, model_id: str = 'benoitfavre/nllb-200-distilled-600m_text2picto', source_column: str = 'simplified', device: str='cuda', batch_size=32):
+def main(output_path: str, dataset_path: str, model_id: str = 'benoitfavre/nllb-200-distilled-600m_text2picto', source_column: str = 'simplified', device: str='cuda', batch_size=3, picto_prefix = '\uE000'):
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     model = AutoModelForSeq2SeqLM.from_pretrained(model_id).to(device)
 
@@ -40,7 +40,7 @@ def main(output_path: str, dataset_path: str, model_id: str = 'benoitfavre/nllb-
             with torch.no_grad():
               gen_out = model.generate(
                   **enc,
-                  num_beams=1,
+                  num_beams=4,
                   #max_new_tokens=48,
                   min_new_tokens=2,
                   no_repeat_ngram_size=3,
@@ -51,11 +51,15 @@ def main(output_path: str, dataset_path: str, model_id: str = 'benoitfavre/nllb-
                   eos_token_id=tokenizer.eos_token_id,
                   pad_token_id=tokenizer.pad_token_id,
                   logits_processor=LogitsProcessorList([picto_token_ids]) if to_lid == 'picto' else None,
+                  renormalize_logits=True,
+                  output_scores=True,
+                  return_dict_in_generate=True,
+                  #do_sample=True, num_beams=4,
               )
             if to_lid == 'picto':
-                return [' '.join([tokenizer.decode(x) for x in sequence if x not in tokenizer.all_special_ids + [tokenizer.encode(' ')]]) for sequence in gen_out]
+                return [' '.join([tokenizer.decode(x).replace(picto_prefix, '') for x in sequence if x not in tokenizer.all_special_ids + [tokenizer.encode(' ')]]) for sequence in gen_out.sequences], gen_out.sequences_scores.exp().to('cpu')
             else:
-                return tokenizer.batch_decode(gen_out, skip_special_tokens=True)
+                return tokenizer.batch_decode(gen_out.sequences, skip_special_tokens=True), gen_out.sequences_scores.exp().to('cpu')
 
 
 
@@ -82,9 +86,10 @@ def main(output_path: str, dataset_path: str, model_id: str = 'benoitfavre/nllb-
     
     output = []
     for batch in tqdm(iterator(), total=total // batch_size):
-        result = gen_dir([x['text'].strip().lower() for x in batch], 'fra_Latn', 'picto')
-        for instance, picto in zip(batch, result):
-            instance['pictos'] = picto.split()
+        result, scores = gen_dir([x['text'].strip().lower() for x in batch], 'fra_Latn', 'picto')
+        for instance, picto, score in zip(batch, result, scores):
+            instance['pictos'] = picto.strip().split()
+            instance['score'] = score.item()
             output.append(instance)
             if len(output) % 1000 == 0:
                 Dataset.from_list(output).to_parquet(output_path)
