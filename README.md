@@ -11,12 +11,11 @@ Pictogram token embeddings are initialized from the mean of their associated lem
 
 The script is configured to train on 80k steps which runs in ~10h on a single A100. The resulting model is saved in `./<model_id>_text2picto`. It can be uploaded with `hf upload <new-model_id> <directory>`.
 
-Example inference code is provided for converting a parquet dataset of sentences to pictos. In includes a logits processor to enforce that only tokens from Arassac are generated.
+Example inference code is provided for converting a parquet dataset of sentences to pictos. In includes a logits processor to enforce that only tokens from Arassac are generated, and saves the confidence score associated with the instance. A demo is available at https://huggingface.co/spaces/benoitfavre/text2picto-fr.
 
 Limitations:
 - translation quality really depends on training data coverage, generalization is much worse than with a LLM
 - only concepts from the Arasaac lexicon can be represented, meaning that most named entities will be generalized or hallucinated
 - although the meaning of pictogram sequences is ambiguous, only one translation is generated
 
-TODO:
-- Remove the requirement for space tokens between picto tokens
+Note: the tokenizer is modified to account for pictogram ids. Each picto is a string prefixed by "\uE000" (first character of the private unicode plane to avoid ambiguity). Picto ids are not separated by space.
